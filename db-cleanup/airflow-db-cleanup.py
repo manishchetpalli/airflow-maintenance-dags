@@ -14,9 +14,9 @@ from airflow import settings
 from airflow.configuration import conf
 from airflow.models import DAG, DagTag, DagModel, DagRun, Log, XCom, SlaMiss, TaskInstance, Variable
 try:
-    from airflow.jobs import BaseJob
+    from airflow.jobs.job import Job
 except Exception as e:
-    from airflow.jobs.base_job import BaseJob
+    from airflow.jobs.job import Job
 from airflow.operators.python_operator import PythonOperator
 from datetime import datetime, timedelta
 import dateutil.parser
@@ -33,13 +33,26 @@ try:
 except ImportError:
     now = datetime.utcnow
 
+from airflow.models import Param
+
+# Define a parameter for the DAG
+dag_params = {
+    "maxDBEntryAgeInDays": Param(
+        default=Variable.get("airflow_db_cleanup__max_db_entry_age_in_days", 30),
+        type="integer",
+        description="Maximum age (in days) of database entries to retain."
+    )
+}
+
+
 # airflow-db-cleanup
-DAG_ID = os.path.basename(__file__).replace(".pyc", "").replace(".py", "")
+#DAG_ID = os.path.basename(__file__).replace(".pyc", "").replace(".py", "")
 START_DATE = airflow.utils.dates.days_ago(1)
+DAG_NAME='AIRFLOW_DB_CLEANUP'
 # How often to Run. @daily - Once a day at Midnight (UTC)
 SCHEDULE_INTERVAL = "@daily"
 # Who is listed as the owner of this DAG in the Airflow Web Server
-DAG_OWNER_NAME = "operations"
+DAG_OWNER_NAME = "DLK_ADMIN"
 # List of email address to send email alerts to if this job fails
 ALERT_EMAIL_ADDRESSES = []
 # Length to retain the log files if not already provided in the conf. If this
@@ -64,8 +77,8 @@ except AttributeError:
 # want to skip.
 DATABASE_OBJECTS = [
     {
-        "airflow_db_model": BaseJob,
-        "age_check_column": BaseJob.latest_heartbeat,
+        "airflow_db_model": Job,
+        "age_check_column": Job.latest_heartbeat,
         "keep_last": False,
         "keep_last_filters": None,
         "keep_last_group_by": None
@@ -79,7 +92,7 @@ DATABASE_OBJECTS = [
     },
     {
         "airflow_db_model": TaskInstance,
-        "age_check_column": TaskInstance.execution_date,
+        "age_check_column": TaskInstance.end_date,
         "keep_last": False,
         "keep_last_filters": None,
         "keep_last_group_by": None
@@ -93,7 +106,7 @@ DATABASE_OBJECTS = [
     },
     {
         "airflow_db_model": XCom,
-        "age_check_column": XCom.execution_date,
+        "age_check_column": XCom.timestamp,
         "keep_last": False,
         "keep_last_filters": None,
         "keep_last_group_by": None
@@ -118,7 +131,7 @@ try:
     from airflow.models import TaskReschedule
     DATABASE_OBJECTS.append({
         "airflow_db_model": TaskReschedule,
-        "age_check_column": TaskReschedule.execution_date,
+        "age_check_column": TaskReschedule.end_date,
         "keep_last": False,
         "keep_last_filters": None,
         "keep_last_group_by": None
@@ -146,7 +159,7 @@ try:
     from airflow.models import RenderedTaskInstanceFields
     DATABASE_OBJECTS.append({
         "airflow_db_model": RenderedTaskInstanceFields,
-        "age_check_column": RenderedTaskInstanceFields.execution_date,
+        "age_check_column": RenderedTaskInstanceFields.end_date,
         "keep_last": False,
         "keep_last_filters": None,
         "keep_last_group_by": None
@@ -209,11 +222,12 @@ default_args = {
 }
 
 dag = DAG(
-    DAG_ID,
+    DAG_NAME,
     default_args=default_args,
     schedule_interval=SCHEDULE_INTERVAL,
     start_date=START_DATE,
-    tags=['teamclairvoyant', 'airflow-maintenance-dags']
+    params=dag_params,
+    description="DAG to periodically clean Airflow DB.",
 )
 if hasattr(dag, 'doc_md'):
     dag.doc_md = __doc__
@@ -221,36 +235,58 @@ if hasattr(dag, 'catchup'):
     dag.catchup = False
 
 
+
+
 def print_configuration_function(**context):
-    logging.info("Loading Configurations...")
-    dag_run_conf = context.get("dag_run").conf
-    logging.info("dag_run.conf: " + str(dag_run_conf))
-    max_db_entry_age_in_days = None
-    if dag_run_conf:
-        max_db_entry_age_in_days = dag_run_conf.get(
-            "maxDBEntryAgeInDays", None
-        )
-    logging.info("maxDBEntryAgeInDays from dag_run.conf: " + str(dag_run_conf))
-    if (max_db_entry_age_in_days is None or max_db_entry_age_in_days < 1):
-        logging.info(
-            "maxDBEntryAgeInDays conf variable isn't included or Variable " +
-            "value is less than 1. Using Default '" +
-            str(DEFAULT_MAX_DB_ENTRY_AGE_IN_DAYS) + "'"
-        )
-        max_db_entry_age_in_days = DEFAULT_MAX_DB_ENTRY_AGE_IN_DAYS
-    max_date = now() + timedelta(-max_db_entry_age_in_days)
+    # Fetch the parameter value from the DAG
+    max_db_entry_age_in_days = context["dag"].params["maxDBEntryAgeInDays"]
+
+    # Check if the value is overridden at runtime using --conf
+    dag_run_conf = context.get("dag_run").conf or {}
+    if "maxDBEntryAgeInDays" in dag_run_conf:
+        max_db_entry_age_in_days = dag_run_conf["maxDBEntryAgeInDays"]
+
+    logging.info(f"Using maxDBEntryAgeInDays: {max_db_entry_age_in_days}")
+
+    # Calculate the maximum date for deletion
+    max_date = now() + timedelta(days=-max_db_entry_age_in_days)
+
     logging.info("Finished Loading Configurations")
-    logging.info("")
-
-    logging.info("Configurations:")
-    logging.info("max_db_entry_age_in_days: " + str(max_db_entry_age_in_days))
-    logging.info("max_date:                 " + str(max_date))
-    logging.info("enable_delete:            " + str(ENABLE_DELETE))
-    logging.info("session:                  " + str(session))
-    logging.info("")
-
     logging.info("Setting max_execution_date to XCom for Downstream Processes")
     context["ti"].xcom_push(key="max_date", value=max_date.isoformat())
+
+
+
+#def print_configuration_function(**context):
+ #   logging.info("Loading Configurations...")
+ #   dag_run_conf = context.get("dag_run").conf
+ #   logging.info("dag_run.conf: " + str(dag_run_conf))
+ #   max_db_entry_age_in_days = None
+ #   if dag_run_conf:
+ #       max_db_entry_age_in_days = dag_run_conf.get(
+ #           "maxDBEntryAgeInDays", None
+ #       )
+ #   logging.info("maxDBEntryAgeInDays from dag_run.conf: " + str(dag_run_conf))
+ #   if (max_db_entry_age_in_days is None or max_db_entry_age_in_days < 1):
+ #      logging.info(
+ #           "maxDBEntryAgeInDays conf variable isn't included or Variable " +
+ #           "value is less than 1. Using Default '" +
+ #           str(DEFAULT_MAX_DB_ENTRY_AGE_IN_DAYS) + "'"
+ #       )
+ #       max_db_entry_age_in_days = DEFAULT_MAX_DB_ENTRY_AGE_IN_DAYS
+ #   max_date = now() + timedelta(-max_db_entry_age_in_days)
+ #   logging.info("Finished Loading Configurations")
+ #   logging.info("")
+ #
+ #   logging.info("Configurations:")
+ #   logging.info("max_db_entry_age_in_days: " + str(max_db_entry_age_in_days))
+ #   logging.info("max_date:                 " + str(max_date))
+ #   logging.info("enable_delete:            " + str(ENABLE_DELETE))
+ #   logging.info("session:                  " + str(session))
+ #   logging.info("")
+ #
+ #   logging.info("Setting max_execution_date to XCom for Downstream Processes")
+ #   context["ti"].xcom_push(key="max_date", value=max_date.isoformat())
 
 
 print_configuration = PythonOperator(
